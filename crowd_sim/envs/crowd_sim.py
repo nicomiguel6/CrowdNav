@@ -3,11 +3,16 @@ import gym
 import matplotlib.lines as mlines
 import numpy as np
 import rvo2
+import pysocialforce
+import os
+import matplotlib
 from matplotlib import patches
+from matplotlib.animation import FFMpegWriter
 from numpy.linalg import norm
 from crowd_sim.envs.utils.human import Human
 from crowd_sim.envs.utils.info import *
 from crowd_sim.envs.utils.utils import point_to_segment_dist
+#matplotlib.rcParams['animation.ffmpeg_path'] = '/usr/local/bin/ffmpeg'
 
 
 class CrowdSim(gym.Env):
@@ -29,8 +34,11 @@ class CrowdSim(gym.Env):
         self.human_times = None
         # reward function
         self.success_reward = None
+        self.travelling_reward_factor = None
         self.collision_penalty = None
         self.discomfort_dist = None
+        self.discomfort_dist_slow = None
+        self.discomfort_dist_fast = None
         self.discomfort_penalty_factor = None
         # simulation configuration
         self.config = None
@@ -54,8 +62,11 @@ class CrowdSim(gym.Env):
         self.time_step = config.getfloat('env', 'time_step')
         self.randomize_attributes = config.getboolean('env', 'randomize_attributes')
         self.success_reward = config.getfloat('reward', 'success_reward')
+        self.travelling_reward_factor = config.getfloat('reward', 'travelling_reward_factor')
         self.collision_penalty = config.getfloat('reward', 'collision_penalty')
         self.discomfort_dist = config.getfloat('reward', 'discomfort_dist')
+        self.discomfort_dist_slow = config.getfloat('reward', 'discomfort_dist_slow')
+        self.discomfort_dist_fast = config.getfloat('reward', 'discomfort_dist_fast')
         self.discomfort_penalty_factor = config.getfloat('reward', 'discomfort_penalty_factor')
         if self.config.get('humans', 'policy') == 'orca':
             self.case_capacity = {'train': np.iinfo(np.uint32).max - 2000, 'val': 1000, 'test': 1000}
@@ -101,9 +112,9 @@ class CrowdSim(gym.Env):
             for i in range(human_num):
                 self.humans.append(self.generate_circle_crossing_human())
         elif rule == 'mixed':
-            # mix different raining simulation with certain distribution
+            # mix different training simulation with certain distribution
             static_human_num = {0: 0.05, 1: 0.2, 2: 0.2, 3: 0.3, 4: 0.1, 5: 0.15}
-            dynamic_human_num = {1: 0.3, 2: 0.3, 3: 0.2, 4: 0.1, 5: 0.1}
+            dynamic_human_num = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.9, 5: 0.1}
             static = True if np.random.random() < 0.2 else False
             prob = np.random.random()
             for key, value in sorted(static_human_num.items() if static else dynamic_human_num.items()):
@@ -153,7 +164,14 @@ class CrowdSim(gym.Env):
             raise ValueError("Rule doesn't exist")
 
     def generate_circle_crossing_human(self):
-        human = Human(self.config, 'humans')
+        label = None
+        if np.random.random() > 0.5:
+            human = Human(self.config, 'humans_slow')
+            label = 'Slow'
+        else:
+            human = Human(self.config, 'humans_fast')
+            label = 'Fast'
+        #human = Human(self.config, 'humans_slow')
         if self.randomize_attributes:
             human.sample_random_attributes()
         while True:
@@ -173,10 +191,18 @@ class CrowdSim(gym.Env):
             if not collide:
                 break
         human.set(px, py, -px, -py, 0, 0, 0)
+        human.set_label(label)
         return human
 
     def generate_square_crossing_human(self):
-        human = Human(self.config, 'humans')
+        label = None
+        if np.random.random() > 0.5:
+            human = Human(self.config, 'humans_slow')
+            label = 'Slow'
+        else:
+            human = Human(self.config, 'humans_fast')
+            label = 'Fast'
+        #human = Human(self.config, 'humans_fast')
         if self.randomize_attributes:
             human.sample_random_attributes()
         if np.random.random() > 0.5:
@@ -204,6 +230,7 @@ class CrowdSim(gym.Env):
             if not collide:
                 break
         human.set(px, py, gx, gy, 0, 0, 0)
+        human.set_label(label)
         return human
 
     def get_human_times(self):
@@ -218,7 +245,7 @@ class CrowdSim(gym.Env):
         if not self.robot.reached_destination():
             raise ValueError('Episode is not done yet')
         params = (10, 10, 5, 5)
-        sim = rvo2.PyRVOSimulator(self.time_step, *params, 0.3, 1)
+        sim = rvo2.PyRVOSimulator(self.time_step, *params, 0.3, 3)
         sim.addAgent(self.robot.get_position(), *params, self.robot.radius, self.robot.v_pref,
                      self.robot.get_velocity())
         for human in self.humans:
@@ -247,6 +274,36 @@ class CrowdSim(gym.Env):
 
         del sim
         return self.human_times
+    
+    def get_psf_human_times(self, scene_config):
+        # centralized pysocialforce simulator for all humans
+        if not self.robot.reached_destination():
+            raise ValueError('Episode is not done yet')
+        full_human_state = []
+        for human in self.humans:
+            full_human_state.append([human.get_position, human.get_velocity, human.get_goal_position()])
+        groups = [[0,1], [2], [3,4], [5]]
+
+        sim = pysocialforce.Simulator(full_human_state, groups=groups, obstacles=None, config_file=scene_config)
+        
+        max_time = 1000
+        while not all(self.human_times):
+            sim.step()
+            self.global_time += self.time_step
+            if self.global_time > max_time:
+                logging.warning('Simulation cannot terminate!')
+            for i, human in enumerate(self.humans):
+                if self.human_times[i] == 0 and human.reached_destination():
+                    self.human_times[i] = self.global_time
+
+            # for visualization
+            for i, human in enumerate(self.humans):
+                human.set_position(sim.getAgentPosition(i + 1))
+            self.states.append([self.robot.get_full_state(), [human.get_full_state() for human in self.humans]])
+
+        del sim
+        return self.human_times
+
 
     def reset(self, phase='test', test_case=None):
         """
@@ -323,13 +380,21 @@ class CrowdSim(gym.Env):
         for human in self.humans:
             # observation for humans is always coordinates
             ob = [other_human.get_observable_state() for other_human in self.humans if other_human != human]
+            #ob = [other_human.get_full_state for other_human in self.humans if other_human != human]
             if self.robot.visible:
                 ob += [self.robot.get_observable_state()]
             human_actions.append(human.act(ob))
 
         # collision detection
+        '''
+        Modified to incorporate two classes of human: fast and slow
+        
+        If closest distance is to faster agent, more severe penalty
+        If closest distance is to slower/normal agent, less severe penalty
+        '''
         dmin = float('inf')
         collision = False
+        label_closest = None
         for i, human in enumerate(self.humans):
             px = human.px - self.robot.px
             py = human.py - self.robot.py
@@ -349,6 +414,7 @@ class CrowdSim(gym.Env):
                 break
             elif closest_dist < dmin:
                 dmin = closest_dist
+                label_closest = human.get_label()
 
         # collision detection between humans
         human_num = len(self.humans)
@@ -377,14 +443,23 @@ class CrowdSim(gym.Env):
             reward = self.success_reward
             done = True
             info = ReachGoal()
-        elif dmin < self.discomfort_dist:
+        elif dmin < self.discomfort_dist_fast and label_closest == 'Fast':
             # only penalize agent for getting too close if it's visible
             # adjust the reward based on FPS
-            reward = (dmin - self.discomfort_dist) * self.discomfort_penalty_factor * self.time_step
+            # heavier penalty for proximity to faster agent
+            reward = (dmin - self.discomfort_dist_fast) * self.discomfort_penalty_factor * self.time_step
+            done = False
+            info = Danger(dmin)
+        elif dmin < self.discomfort_dist_slow and label_closest == 'Slow':
+            # lesser penalty for proximity to slower/normal agent
+            reward = (dmin - self.discomfort_dist_slow) * self.discomfort_penalty_factor * self.time_step
             done = False
             info = Danger(dmin)
         else:
-            reward = 0
+            # add small reward or penalty depending on if moving away from goal or to goal
+            goal_distance_step = norm(end_position - np.array(self.robot.get_goal_position()))
+            goal_distance_now = norm(np.array(self.robot.get_position()) - np.array(self.robot.get_goal_position()))
+            reward = self.travelling_reward_factor * (goal_distance_now - goal_distance_step)
             done = False
             info = Nothing()
 
@@ -437,7 +512,8 @@ class CrowdSim(gym.Env):
             ax.set_xlim(-4, 4)
             ax.set_ylim(-4, 4)
             for human in self.humans:
-                human_circle = plt.Circle(human.get_position(), human.radius, fill=False, color='b')
+                color_human = 'm' if human.get_label() == 'Fast' else 'b'
+                human_circle = plt.Circle(human.get_position(), human.radius, fill=False, color=color_human)
                 ax.add_artist(human_circle)
             ax.add_artist(plt.Circle(self.robot.get_position(), self.robot.radius, fill=True, color='r'))
             plt.show()
@@ -499,15 +575,28 @@ class CrowdSim(gym.Env):
             plt.legend([robot, goal], ['Robot', 'Goal'], fontsize=16)
 
             # add humans and their numbers
+            def get_color_based_on_label(human):
+                return 'm' if human.get_label() == 'Fast' else 'b'
+
             human_positions = [[state[1][j].position for j in range(len(self.humans))] for state in self.states]
-            humans = [plt.Circle(human_positions[0][i], self.humans[i].radius, fill=False)
-                      for i in range(len(self.humans))]
-            human_numbers = [plt.text(humans[i].center[0] - x_offset, humans[i].center[1] - y_offset, str(i),
-                                      color='black', fontsize=12) for i in range(len(self.humans))]
+
+            # Create circles and texts for each human with colors based on their speed
+            humans = []
+            human_numbers = []
+            for i in range(len(self.humans)):
+                color_human = get_color_based_on_label(self.humans[i])
+                human_circle = plt.Circle(human_positions[0][i], self.humans[i].radius, fill=False, color=color_human)
+                humans.append(human_circle)
+
+                human_number = plt.text(human_circle.center[0] - x_offset, human_circle.center[1] - y_offset, str(i),
+                                        color=color_human, fontsize=12)
+                human_numbers.append(human_number)
+
+            # Add circles and texts to the axes
             for i, human in enumerate(humans):
                 ax.add_artist(human)
                 ax.add_artist(human_numbers[i])
-
+            
             # add time annotation
             time = plt.text(-1, 5, 'Time: {}'.format(0), fontsize=16)
             ax.add_artist(time)
@@ -601,8 +690,8 @@ class CrowdSim(gym.Env):
             anim.running = True
 
             if output_file is not None:
-                ffmpeg_writer = animation.writers['ffmpeg']
-                writer = ffmpeg_writer(fps=8, metadata=dict(artist='Me'), bitrate=1800)
+                #ffmpeg_writer = animation.writers['ffmpeg']
+                writer = FFMpegWriter(fps=8, metadata=dict(artist='Me'), bitrate=1800)
                 anim.save(output_file, writer=writer)
             else:
                 plt.show()

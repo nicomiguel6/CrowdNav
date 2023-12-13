@@ -27,6 +27,8 @@ class Agent(object):
         self.vy = None
         self.theta = None
         self.time_step = None
+        self.label = None  # 'Fast' == humans_fast, 'Slow' == humans_slow, None == robot/humans base class
+
 
     def print_info(self):
         logging.info('Agent is {} and has {} kinematic constraint'.format(
@@ -92,6 +94,12 @@ class Agent(object):
     def set_velocity(self, velocity):
         self.vx = velocity[0]
         self.vy = velocity[1]
+
+    def get_label(self):
+        return self.label
+    
+    def set_label(self, label):
+        self.label = label
 
     @abc.abstractmethod
     def act(self, ob):

@@ -9,6 +9,8 @@ from crowd_nav.utils.explorer import Explorer
 from crowd_nav.policy.policy_factory import policy_factory
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
+from crowd_sim.envs.policy.pysf import pySocialForce
+
 
 
 def main():
@@ -24,6 +26,7 @@ def main():
     parser.add_argument('--test_case', type=int, default=None)
     parser.add_argument('--square', default=False, action='store_true')
     parser.add_argument('--circle', default=False, action='store_true')
+    parser.add_argument('--mixed', default=False, action='store_true')
     parser.add_argument('--video_file', type=str, default=None)
     parser.add_argument('--traj', default=False, action='store_true')
     args = parser.parse_args()
@@ -67,6 +70,8 @@ def main():
         env.test_sim = 'square_crossing'
     if args.circle:
         env.test_sim = 'circle_crossing'
+    if args.mixed:
+        env.test_sim = 'mixed'
     robot = Robot(env_config, 'robot')
     robot.set_policy(policy)
     env.set_robot(robot)
@@ -103,7 +108,7 @@ def main():
 
         logging.info('It takes %.2f seconds to finish. Final status is %s', env.global_time, info)
         if robot.visible and info == 'reach goal':
-            human_times = env.get_human_times()
+            human_times = env.get_human_times(env_config)
             logging.info('Average time for humans to reach goal: %.2f', sum(human_times) / len(human_times))
     else:
         explorer.run_k_episodes(env.case_size[args.phase], args.phase, print_failure=True)
